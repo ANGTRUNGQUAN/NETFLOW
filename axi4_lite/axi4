@@ -1,0 +1,210 @@
+`timescale 1ns / 1ps
+
+// =========================================================================================
+// Module: axi4lite_flow_reader
+// Description: AXI4-Lite slave with robust POP/LATCH pipeline.
+//time: 2:19pm 27/08/25
+// =========================================================================================
+module axi4lite_flow_reader #(
+  parameter integer C_S_AXI_ADDR_WIDTH = 6,
+  parameter integer C_S_AXI_DATA_WIDTH = 32,
+  parameter integer FRAME_BITS = 240,
+  parameter integer WORDS = 8,
+  parameter [C_S_AXI_DATA_WIDTH-1:0] VALID_TAIL_MASK = 32'h0000FFFF
+)(
+  // Global Signals
+  input wire aclk,
+  input wire aresetn,
+
+  // AXI4-Lite slave interface
+  input wire [C_S_AXI_ADDR_WIDTH-1:0] S_AXI_AWADDR,
+  input wire S_AXI_AWVALID,
+  output wire S_AXI_AWREADY,
+  input wire [C_S_AXI_DATA_WIDTH-1:0] S_AXI_WDATA,
+  input wire [(C_S_AXI_DATA_WIDTH/8)-1:0] S_AXI_WSTRB,
+  input wire S_AXI_WVALID,
+  output wire S_AXI_WREADY,
+  output reg [1:0] S_AXI_BRESP,
+  output reg S_AXI_BVALID,
+  input wire S_AXI_BREADY,
+  input wire [C_S_AXI_ADDR_WIDTH-1:0] S_AXI_ARADDR,
+  input wire S_AXI_ARVALID,
+  output reg S_AXI_ARREADY,
+  output reg [C_S_AXI_DATA_WIDTH-1:0] S_AXI_RDATA,
+  output reg [1:0] S_AXI_RRESP,
+  output reg S_AXI_RVALID,
+  input wire S_AXI_RREADY,
+
+  // FIFO Export Interface
+  output reg fifo_rd_exp_en,
+  input wire [FRAME_BITS-1:0] fifo_out_exp,
+  input wire fifo_empty_exp
+);
+
+  // --- Address Map & Local Parameters
+  localparam [C_S_AXI_ADDR_WIDTH-1:0] ADDR_STATUS_REG = 6'h00;
+  localparam [C_S_AXI_ADDR_WIDTH-1:0] ADDR_FIFO_STATUS_REG = 6'h04;
+  localparam [C_S_AXI_ADDR_WIDTH-1:0] ADDR_VALID_MASK_REG = 6'h08;
+  localparam [C_S_AXI_ADDR_WIDTH-1:0] ADDR_DATA_WORD0 = 6'h10;
+  localparam [C_S_AXI_ADDR_WIDTH-1:0] ADDR_DATA_WORD1 = 6'h14;
+  localparam [C_S_AXI_ADDR_WIDTH-1:0] ADDR_DATA_WORD2 = 6'h18;
+  localparam [C_S_AXI_ADDR_WIDTH-1:0] ADDR_DATA_WORD3 = 6'h1c;
+  localparam [C_S_AXI_ADDR_WIDTH-1:0] ADDR_DATA_WORD4 = 6'h20;
+  localparam [C_S_AXI_ADDR_WIDTH-1:0] ADDR_DATA_WORD5 = 6'h24;
+  localparam [C_S_AXI_ADDR_WIDTH-1:0] ADDR_DATA_WORD6 = 6'h28;
+  localparam [C_S_AXI_ADDR_WIDTH-1:0] ADDR_DATA_WORD7 = 6'h2c;
+  localparam [C_S_AXI_ADDR_WIDTH-1:0] ADDR_DATA_END = 6'h30;
+
+  // --- Internal Signals
+  reg [FRAME_BITS-1:0] frame_reg;
+  reg [WORDS-1:0] slice_rd_bitmap;
+
+  // Control/Status registers
+  reg busy_reg;
+  reg done_reg;
+
+  // AXI handshake & latches
+  reg [C_S_AXI_ADDR_WIDTH-1:0] ar_addr_latched;
+  reg read_req_pending;
+
+  // FSM for FIFO control and data latching
+  localparam [2:0] S_IDLE = 3'b000;
+  localparam [2:0] S_POP = 3'b001;
+  localparam [2:0] S_LATCH = 3'b010;
+  localparam [2:0] S_SERVE = 3'b011;
+
+  reg [2:0] fsm_state;
+  reg [2:0] fsm_next_state;
+
+  // AXI Lite is READ-ONLY. Write channels are always ready.
+  assign S_AXI_AWREADY = 1'b1;
+  assign S_AXI_WREADY = 1'b1;
+  always @(posedge aclk or negedge aresetn) begin
+    if (!aresetn) begin
+      S_AXI_BVALID <= 1'b0;
+      S_AXI_BRESP <= 2'b00;
+    end else begin
+      if (S_AXI_WVALID && S_AXI_AWVALID) begin
+        S_AXI_BVALID <= 1'b1;
+        S_AXI_BRESP <= 2'b00;
+      end else if (S_AXI_BVALID && S_AXI_BREADY) begin
+        S_AXI_BVALID <= 1'b0;
+      end
+    end
+  end
+
+  // --- AXI Read Path
+  always @(posedge aclk or negedge aresetn) begin
+    if (!aresetn) begin
+      S_AXI_ARREADY <= 1'b0;
+      S_AXI_RVALID <= 1'b0;
+      S_AXI_RDATA <= {C_S_AXI_DATA_WIDTH{1'b0}};
+      S_AXI_RRESP <= 2'b00;
+      ar_addr_latched <= {C_S_AXI_ADDR_WIDTH{1'b0}};
+      read_req_pending <= 1'b0;
+    end else begin
+      // ARREADY logic
+      S_AXI_ARREADY <= S_AXI_ARVALID && !read_req_pending && !S_AXI_RVALID;
+      if (S_AXI_ARVALID && S_AXI_ARREADY) begin
+        ar_addr_latched <= S_AXI_ARADDR;
+        read_req_pending <= 1'b1;
+      end
+
+      // RVALID & RDATA logic
+      if (read_req_pending && !S_AXI_RVALID) begin
+        S_AXI_RVALID <= 1'b1;
+        S_AXI_RRESP <= 2'b00;
+        // Assign RDATA based on latched address
+        case (ar_addr_latched)
+          ADDR_STATUS_REG: S_AXI_RDATA <= {30'b0, done_reg, busy_reg};
+          ADDR_FIFO_STATUS_REG: S_AXI_RDATA <= {31'b0, fifo_empty_exp};
+          ADDR_VALID_MASK_REG: S_AXI_RDATA <= VALID_TAIL_MASK;
+          ADDR_DATA_WORD0: S_AXI_RDATA <= frame_reg[31:0];
+          ADDR_DATA_WORD1: S_AXI_RDATA <= frame_reg[63:32];
+          ADDR_DATA_WORD2: S_AXI_RDATA <= frame_reg[95:64];
+          ADDR_DATA_WORD3: S_AXI_RDATA <= frame_reg[127:96];
+          ADDR_DATA_WORD4: S_AXI_RDATA <= frame_reg[159:128];
+          ADDR_DATA_WORD5: S_AXI_RDATA <= frame_reg[191:160];
+          ADDR_DATA_WORD6: S_AXI_RDATA <= frame_reg[223:192];
+          ADDR_DATA_WORD7: S_AXI_RDATA <= {16'h0000, frame_reg[239:224]};
+          default: S_AXI_RDATA <= 32'hDEADBEEF;
+        endcase
+      end else if (S_AXI_RVALID && S_AXI_RREADY) begin
+        S_AXI_RVALID <= 1'b0;
+        read_req_pending <= 1'b0;
+      end
+    end
+  end
+
+  // --- Internal FSM Logic
+  // Combinatorial part: determine next state
+  always @(*) begin
+    fsm_next_state = fsm_state;
+    case (fsm_state)
+      S_IDLE: begin
+        if (!fifo_empty_exp) begin
+          fsm_next_state = S_POP;
+        end
+      end
+      S_POP: begin
+        fsm_next_state = S_LATCH;
+      end
+      S_LATCH: begin
+        fsm_next_state = S_SERVE;
+      end
+      S_SERVE: begin
+        if (slice_rd_bitmap == {WORDS{1'b1}}) begin
+          fsm_next_state = S_IDLE;
+        end else begin
+          fsm_next_state = S_SERVE;
+        end
+      end
+      default: fsm_next_state = S_IDLE;
+    endcase
+  end
+
+  // Synchronous part: update state and all related registers
+  always @(posedge aclk or negedge aresetn) begin
+    if (!aresetn) begin
+      fsm_state <= S_IDLE;
+      fifo_rd_exp_en <= 1'b0;
+      frame_reg <= {FRAME_BITS{1'b0}};
+      slice_rd_bitmap <= {WORDS{1'b0}};
+      busy_reg <= 1'b0;
+      done_reg <= 1'b0;
+    end else begin
+      fsm_state <= fsm_next_state;
+
+      // New logic for POP and LATCH with pipeline
+      if (fsm_state == S_IDLE && fsm_next_state == S_POP) begin
+        fifo_rd_exp_en <= 1'b1;
+      end else begin
+        fifo_rd_exp_en <= 1'b0;
+		  frame_reg <= fifo_out_exp;
+      end
+
+      if (fsm_state == S_POP && fsm_next_state == S_LATCH) begin
+        //frame_reg <= fifo_out_exp;
+        busy_reg <= 1'b1;
+        done_reg <= 1'b0;
+        slice_rd_bitmap <= {WORDS{1'b0}};
+      end
+      
+      if (fsm_state == S_SERVE && fsm_next_state == S_IDLE) begin
+        busy_reg <= 1'b0;
+        done_reg <= 1'b1;
+      end
+
+      // Update slice bitmap and clear done flag on read
+      if (read_req_pending && S_AXI_RVALID && S_AXI_RREADY) begin
+        if (ar_addr_latched >= ADDR_DATA_WORD0 && ar_addr_latched < ADDR_DATA_END) begin
+          slice_rd_bitmap[ar_addr_latched[4:2]] <= 1'b1;
+        end
+        if (ar_addr_latched == ADDR_STATUS_REG && S_AXI_RDATA[1] == 1'b1) begin
+          done_reg <= 1'b0;
+        end
+      end
+    end
+  end
+
+endmodule
